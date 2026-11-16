@@ -5,6 +5,7 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.graphics.Bitmap
 import android.graphics.PixelFormat
 import android.graphics.Rect
 import android.graphics.SurfaceTexture
@@ -25,6 +26,9 @@ class WidgetVisibilityService : AccessibilityService() {
 
     companion object {
         var instance: WidgetVisibilityService? = null
+        // Resolución HD optimizada para widgets sin superar el límite de memoria Binder de Android
+        private const val VIDEO_WIDTH = 768
+        private const val VIDEO_HEIGHT = 432
     }
 
     private lateinit var libVLC: LibVLC
@@ -32,6 +36,7 @@ class WidgetVisibilityService : AccessibilityService() {
     private lateinit var hiddenContainer: LinearLayout
     private val mainHandler = Handler(Looper.getMainLooper())
     private val activeStreams = mutableMapOf<Int, StreamSession>()
+    private val missedChecksCount = mutableMapOf<Int, Int>()
     private var isScreenOn = true
 
     private inner class StreamSession(
@@ -46,18 +51,23 @@ class WidgetVisibilityService : AccessibilityService() {
             if (isScreenOn && activeStreams.isNotEmpty()) {
                 for ((widgetId, session) in activeStreams) {
                     if (session.isPlaying && session.textureView.isAvailable) {
-                        val bmp = session.textureView.getBitmap(320, 180)
-                        if (bmp != null) {
-                            CameraWidgetProvider.updateWidgetUI(
-                                this@WidgetVisibilityService,
-                                widgetId,
-                                bmp,
-                                null
-                            )
+                        val rawBmp = session.textureView.getBitmap(VIDEO_WIDTH, VIDEO_HEIGHT)
+                        if (rawBmp != null) {
+                            // Convertir a RGB_565 permite enviar alta resolución al widget usando la mitad de RAM
+                            val hdBmp = rawBmp.copy(Bitmap.Config.RGB_565, false)
+                            rawBmp.recycle()
+                            if (hdBmp != null) {
+                                CameraWidgetProvider.updateWidgetUI(
+                                    this@WidgetVisibilityService,
+                                    widgetId,
+                                    hdBmp,
+                                    null
+                                )
+                            }
                         }
                     }
                 }
-                mainHandler.postDelayed(this, 250L)
+                mainHandler.postDelayed(this, 220L)
             }
         }
     }
@@ -66,7 +76,7 @@ class WidgetVisibilityService : AccessibilityService() {
         override fun run() {
             if (isScreenOn) {
                 evaluateVisibleWidgets()
-                mainHandler.postDelayed(this, 850L)
+                mainHandler.postDelayed(this, 1000L)
             }
         }
     }
@@ -89,21 +99,25 @@ class WidgetVisibilityService : AccessibilityService() {
     override fun onServiceConnected() {
         super.onServiceConnected()
         instance = this
-        libVLC = LibVLC(applicationContext, arrayListOf("--network-caching=400"))
+        // Forzar RTSP sobre TCP para evitar pixelación y pérdida de fotogramas
+        libVLC = LibVLC(
+            applicationContext,
+            arrayListOf("--network-caching=500", "--rtsp-tcp")
+        )
 
         windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
         hiddenContainer = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
-            alpha = 0.02f
+            alpha = 0.01f
         }
 
         val params = WindowManager.LayoutParams(
-            240,
-            135,
+            VIDEO_WIDTH,
+            VIDEO_HEIGHT,
             WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
                     WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
-                    WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+                    WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
             PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.TOP or Gravity.START
@@ -123,8 +137,13 @@ class WidgetVisibilityService : AccessibilityService() {
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
-        if (isScreenOn) {
-            evaluateVisibleWidgets()
+        // Ignorar eventos provocados por la propia actualización de fotogramas para evitar parpadeos
+        if (isScreenOn && event != null) {
+            if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED ||
+                event.eventType == AccessibilityEvent.TYPE_VIEW_SCROLLED
+            ) {
+                evaluateVisibleWidgets()
+            }
         }
     }
 
@@ -134,24 +153,31 @@ class WidgetVisibilityService : AccessibilityService() {
     }
 
     private fun evaluateVisibleWidgets() {
+        val root = rootInActiveWindow ?: return
         val displayMetrics = resources.displayMetrics
         val screenRect = Rect(0, 0, displayMetrics.widthPixels, displayMetrics.heightPixels)
         val visibleIds = mutableSetOf<Int>()
 
-        val root = rootInActiveWindow
-        if (root != null) {
-            findWidgetsInNode(root, screenRect, visibleIds)
-            root.recycle()
-        }
+        findWidgetsInNode(root, screenRect, visibleIds)
+        root.recycle()
 
+        // Tolerancia de 2 verificaciones antes de pausar para evitar cortes al refrescar imagen
         val currentIds = activeStreams.keys.toList()
         for (id in currentIds) {
             if (!visibleIds.contains(id)) {
-                stopStream(id)
+                val misses = (missedChecksCount[id] ?: 0) + 1
+                missedChecksCount[id] = misses
+                if (misses >= 2) {
+                    stopStream(id)
+                    missedChecksCount.remove(id)
+                }
+            } else {
+                missedChecksCount[id] = 0
             }
         }
 
         for (id in visibleIds) {
+            missedChecksCount[id] = 0
             if (!activeStreams.containsKey(id)) {
                 startStream(id)
             }
@@ -197,7 +223,7 @@ class WidgetVisibilityService : AccessibilityService() {
         CameraWidgetProvider.updateWidgetUI(this, appWidgetId, null, "Conectando...")
 
         val textureView = TextureView(this).apply {
-            layoutParams = LinearLayout.LayoutParams(240, 135)
+            layoutParams = LinearLayout.LayoutParams(VIDEO_WIDTH, VIDEO_HEIGHT)
         }
         hiddenContainer.addView(textureView)
 
@@ -209,12 +235,13 @@ class WidgetVisibilityService : AccessibilityService() {
             override fun onSurfaceTextureAvailable(surface: SurfaceTexture, width: Int, height: Int) {
                 val vout = mediaPlayer.vlcVout
                 vout.setVideoView(textureView)
-                vout.setWindowSize(240, 135)
+                vout.setWindowSize(VIDEO_WIDTH, VIDEO_HEIGHT)
                 vout.attachViews()
 
                 val media = Media(libVLC, Uri.parse(item.rtspUrl)).apply {
                     setHWDecoderEnabled(true, false)
-                    addOption(":network-caching=400")
+                    addOption(":network-caching=500")
+                    addOption(":rtsp-tcp")
                 }
                 mediaPlayer.media = media
                 media.release()
@@ -276,6 +303,7 @@ class WidgetVisibilityService : AccessibilityService() {
         for (id in ids) {
             stopStream(id)
         }
+        missedChecksCount.clear()
     }
 
     override fun onInterrupt() {
