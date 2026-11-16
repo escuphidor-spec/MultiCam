@@ -7,6 +7,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.graphics.Bitmap
+import android.graphics.Matrix
 import android.graphics.Outline
 import android.graphics.PixelFormat
 import android.graphics.Rect
@@ -17,6 +18,7 @@ import android.os.Looper
 import android.util.Base64
 import android.view.Gravity
 import android.view.MotionEvent
+import android.view.ScaleGestureDetector
 import android.view.TextureView
 import android.view.View
 import android.view.ViewOutlineProvider
@@ -260,42 +262,6 @@ class WidgetVisibilityService : AccessibilityService() {
             clipToOutline = true
         }
 
-        // Detector de gestos de deslizamiento (Arriba, Abajo, Izquierda, Derecha)
-        var downX = 0f
-        var downY = 0f
-        container.setOnTouchListener { _, event ->
-            missedChecksCount[appWidgetId] = 0
-            when (event.actionMasked) {
-                MotionEvent.ACTION_DOWN -> {
-                    downX = event.x
-                    downY = event.y
-                    true
-                }
-                MotionEvent.ACTION_UP -> {
-                    val dx = event.x - downX
-                    val dy = event.y - downY
-                    if (abs(dx) > swipeThreshold || abs(dy) > swipeThreshold) {
-                        val currentItem = WidgetPrefs.getWidget(this@WidgetVisibilityService, appWidgetId)
-                        if (currentItem != null) {
-                            if (abs(dx) > abs(dy)) {
-                                // Deslizamiento horizontal: Derecha (dx > 0) o Izquierda (dx < 0)
-                                // Si gira al revés horizontalmente, invierte "0.6f else -0.6f" por "-0.6f else 0.6f"
-                                val pan = if (dx > 0) 0.6f else -0.6f
-                                moveCameraPtz(currentItem.rtspUrl, pan, 0f)
-                            } else {
-                                // Deslizamiento vertical: Arriba (dy < 0) o Abajo (dy > 0)
-                                // Si gira al revés verticalmente, invierte "0.6f else -0.6f" por "-0.6f else 0.6f"
-                                val tilt = if (dy < 0) 0.6f else -0.6f
-                                moveCameraPtz(currentItem.rtspUrl, 0f, tilt)
-                            }
-                        }
-                    }
-                    true
-                }
-                else -> true
-            }
-        }
-
         val textureView = TextureView(this).apply {
             layoutParams = FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.MATCH_PARENT,
@@ -303,6 +269,56 @@ class WidgetVisibilityService : AccessibilityService() {
             )
         }
         container.addView(textureView)
+
+        // Detector de Zoom por pellizco (ScaleGestureDetector)
+        var currentScale = 1f
+        val scaleDetector = ScaleGestureDetector(this, object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
+            override fun onScale(detector: ScaleGestureDetector): Boolean {
+                currentScale *= detector.scaleFactor
+                currentScale = currentScale.coerceIn(1f, 4f) // Zoom máximo de 4x
+                textureView.scaleX = currentScale
+                textureView.scaleY = currentScale
+                return true
+            }
+        })
+
+        // Detector de gestos de deslizamiento para PTZ y Zoom táctil
+        var downX = 0f
+        var downY = 0f
+        container.setOnTouchListener { _, event ->
+            missedChecksCount[appWidgetId] = 0
+            scaleDetector.onTouchEvent(event)
+
+            if (!scaleDetector.isInProgress) {
+                when (event.actionMasked) {
+                    MotionEvent.ACTION_DOWN -> {
+                        downX = event.x
+                        downY = event.y
+                        true
+                    }
+                    MotionEvent.ACTION_UP -> {
+                        val dx = event.x - downX
+                        val dy = event.y - downY
+                        if (abs(dx) > swipeThreshold || abs(dy) > swipeThreshold) {
+                            val currentItem = WidgetPrefs.getWidget(this@WidgetVisibilityService, appWidgetId)
+                            if (currentItem != null) {
+                                if (abs(dx) > abs(dy)) {
+                                    val pan = if (dx > 0) 0.6f else -0.6f
+                                    moveCameraPtz(currentItem.rtspUrl, pan, 0f)
+                                } else {
+                                    val tilt = if (dy < 0) 0.6f else -0.6f
+                                    moveCameraPtz(currentItem.rtspUrl, 0f, tilt)
+                                }
+                            }
+                        }
+                        true
+                    }
+                    else -> true
+                }
+            } else {
+                true
+            }
+        }
 
         val params = WindowManager.LayoutParams(
             videoRect.width(),
@@ -383,14 +399,12 @@ class WidgetVisibilityService : AccessibilityService() {
         }
     }
 
-    // Controlador ONVIF PTZ multi-cámara (calcula el puerto ONVIF según el puerto RTSP del widget)
     private fun moveCameraPtz(rtspUrl: String, panX: Float, tiltY: Float) {
         ptzExecutor.execute {
             try {
                 val uri = Uri.parse(rtspUrl)
                 val host = uri.host ?: return@execute
                 val rtspPort = if (uri.port != -1) uri.port else 554
-                // Si RTSP es 554 -> ONVIF 8899; si RTSP es 1554 -> ONVIF 18899; si es 2554 -> ONVIF 28899
                 val onvifPort = if (rtspPort > 1000) (rtspPort - 554) + 8899 else 8899
 
                 val userInfo = uri.userInfo ?: ""
@@ -420,7 +434,6 @@ class WidgetVisibilityService : AccessibilityService() {
                 """.trimIndent()
 
                 sendOnvifSoap(host, onvifPort, "/onvif/ptz_service", user, pass, moveBody)
-                // Duración del giro por cada deslizamiento (450 ms)
                 Thread.sleep(450)
                 sendOnvifSoap(host, onvifPort, "/onvif/ptz_service", user, pass, stopBody)
             } catch (_: Exception) {
