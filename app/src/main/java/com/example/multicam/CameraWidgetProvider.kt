@@ -10,6 +10,7 @@ import android.view.View
 import android.widget.RemoteViews
 import com.google.gson.Gson
 import com.google.gson.reflect.TypeToken
+import java.lang.reflect.Type
 
 data class CameraItem(
     val appWidgetId: Int,
@@ -41,7 +42,9 @@ object WidgetPrefs {
     fun getAllWidgets(context: Context): Map<Int, CameraItem> {
         val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         val json = prefs.getString(KEY_MAP, null) ?: return emptyMap()
-        val type = object : TypeToken>() {}.type
+        
+        // Corrección de sintaxis para TypeToken en Kotlin
+        val type: Type = object : TypeToken>() {}.type
         return Gson().fromJson(json, type) ?: emptyMap()
     }
 
