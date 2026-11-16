@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">MultiCam</string>
+    <string name="accessibility_desc">Detecta cuando la ventana del widget de cámara es visible en la pantalla principal para activar el video y audio únicamente mientras lo ves.</string>
+</resources>
