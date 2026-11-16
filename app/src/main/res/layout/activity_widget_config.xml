@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="#121212"
+    android:orientation="vertical"
+    android:padding="24dp">
+
+    <TextView
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="Configurar Widget MultiCam"
+        android:textColor="#FFFFFF"
+        android:textSize="20sp"
+        android:textStyle="bold"
+        android:layout_marginBottom="16dp" />
+
+    <TextView
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="Nombre de la cámara:"
+        android:textColor="#CCCCCC" />
+
+    <EditText
+        android:id="@+id/etConfigName"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:hint="Ej. Entrada, Patio, Sala"
+        android:textColor="#FFFFFF"
+        android:textColorHint="#777777"
+        android:minHeight="48dp"
+        android:layout_marginBottom="16dp" />
+
+    <TextView
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="Dirección RTSP de la cámara:"
+        android:textColor="#CCCCCC" />
+
+    <EditText
+        android:id="@+id/etConfigUrl"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:hint="rtsp://usuario:pass@ip:554/..."
+        android:inputType="textUri"
+        android:textColor="#FFFFFF"
+        android:textColorHint="#777777"
+        android:minHeight="48dp"
+        android:layout_marginBottom="24dp" />
+
+    <Button
+        android:id="@+id/btnSaveWidget"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="Agregar Widget" />
+
+</LinearLayout>
