@@ -1,6 +1,7 @@
 package com.example.multicam
 
 import android.accessibilityservice.AccessibilityService
+import android.annotation.SuppressLint
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
@@ -13,7 +14,9 @@ import android.graphics.SurfaceTexture
 import android.net.Uri
 import android.os.Handler
 import android.os.Looper
+import android.util.Base64
 import android.view.Gravity
+import android.view.MotionEvent
 import android.view.TextureView
 import android.view.View
 import android.view.ViewOutlineProvider
@@ -21,9 +24,20 @@ import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import android.widget.FrameLayout
+import android.widget.Toast
 import org.videolan.libvlc.LibVLC
 import org.videolan.libvlc.Media
 import org.videolan.libvlc.MediaPlayer
+import java.net.HttpURLConnection
+import java.net.URL
+import java.security.MessageDigest
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+import java.util.TimeZone
+import java.util.concurrent.Executors
+import kotlin.math.abs
+import kotlin.random.Random
 
 class WidgetVisibilityService : AccessibilityService() {
 
@@ -34,8 +48,10 @@ class WidgetVisibilityService : AccessibilityService() {
     private lateinit var libVLC: LibVLC
     private lateinit var windowManager: WindowManager
     private val mainHandler = Handler(Looper.getMainLooper())
+    private val ptzExecutor = Executors.newCachedThreadPool()
     private val activeStreams = mutableMapOf<Int, StreamSession>()
     private val missedChecksCount = mutableMapOf<Int, Int>()
+    private val profileTokensCache = mutableMapOf<String, String>()
     private var isScreenOn = true
 
     private inner class StreamSession(
@@ -76,7 +92,6 @@ class WidgetVisibilityService : AccessibilityService() {
         super.onServiceConnected()
         instance = this
 
-        // Reducir tiempo de respuesta de eventos para detectar cambios de ventana al instante
         serviceInfo = serviceInfo.apply {
             notificationTimeout = 30
         }
@@ -125,13 +140,12 @@ class WidgetVisibilityService : AccessibilityService() {
             val rect = visibleWidgets[id]
 
             if (rect == null) {
-                // Ocultar y silenciar al instante al deslizar a otra ventana o abrir una app
-                session.container.alpha = 0f
+                // Ocultar vista inmediatamente para no interceptar toques en otras páginas o apps
+                session.container.visibility = View.GONE
                 session.mediaPlayer.volume = 0
 
                 val misses = (missedChecksCount[id] ?: 0) + 1
                 missedChecksCount[id] = misses
-                // Si permanece fuera de vista por ~750ms, desconectar cámara para ahorrar energía
                 if (misses >= 3) {
                     stopStream(id)
                     missedChecksCount.remove(id)
@@ -140,6 +154,7 @@ class WidgetVisibilityService : AccessibilityService() {
                 missedChecksCount[id] = 0
                 updateOverlayBounds(session, rect)
                 if (session.isPlaying) {
+                    session.container.visibility = View.VISIBLE
                     session.container.alpha = 1f
                     val item = WidgetPrefs.getWidget(this, id)
                     session.mediaPlayer.volume = if (item?.isMuted == true) 0 else 100
@@ -168,7 +183,6 @@ class WidgetVisibilityService : AccessibilityService() {
                 val bounds = Rect()
                 node.getBoundsInScreen(bounds)
                 val intersection = Rect(bounds)
-                // Mostrar video solo cuando el widget está asentado en la página actual (>= 85% visible)
                 if (intersection.intersect(screenRect) &&
                     bounds.width() > 80 &&
                     bounds.height() > 80 &&
@@ -194,7 +208,6 @@ class WidgetVisibilityService : AccessibilityService() {
 
     private fun calculateVideoRect(widgetBounds: Rect): Rect {
         val density = resources.displayMetrics.density
-        // Respetar los 36dp superiores donde están el título y el botón de silenciar del widget
         val headerPx = (36 * density).toInt()
         val top = widgetBounds.top + headerPx
         val width = widgetBounds.width().coerceAtLeast(100)
@@ -206,7 +219,6 @@ class WidgetVisibilityService : AccessibilityService() {
         if (!session.container.isAttachedToWindow) return
         val videoRect = calculateVideoRect(widgetBounds)
 
-        // Calibrar coordenadas exactas de pantalla (compensa barra de estado o notch)
         val loc = IntArray(2)
         session.container.getLocationOnScreen(loc)
         val offsetX = loc[0] - session.params.x
@@ -231,21 +243,57 @@ class WidgetVisibilityService : AccessibilityService() {
         }
     }
 
+    @SuppressLint("ClickableViewAccessibility")
     private fun startStream(appWidgetId: Int, initialBounds: Rect) {
         val item = WidgetPrefs.getWidget(this, appWidgetId) ?: return
         CameraWidgetProvider.updateWidgetUI(this, appWidgetId, null, "Conectando...")
 
         val videoRect = calculateVideoRect(initialBounds)
         val cornerRadius = 14f * resources.displayMetrics.density
+        val swipeThreshold = 35f * resources.displayMetrics.density
 
         val container = FrameLayout(this).apply {
-            alpha = 0f // Invisible mientras carga para mostrar el texto "Conectando..."
+            alpha = 0f
             outlineProvider = object : ViewOutlineProvider() {
                 override fun getOutline(view: View, outline: Outline) {
                     outline.setRoundRect(0, -cornerRadius.toInt(), view.width, view.height, cornerRadius)
                 }
             }
             clipToOutline = true
+        }
+
+        // Detector de deslizamiento (Arriba, Abajo, Izquierda, Derecha) para mover la cámara
+        var downX = 0f
+        var downY = 0f
+        container.setOnTouchListener { _, event ->
+            missedChecksCount[appWidgetId] = 0
+            when (event.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    downX = event.x
+                    downY = event.y
+                    true
+                }
+                MotionEvent.ACTION_UP -> {
+                    val dx = event.x - downX
+                    val dy = event.y - downY
+                    if (abs(dx) > swipeThreshold || abs(dy) > swipeThreshold) {
+                        val currentItem = WidgetPrefs.getWidget(this@WidgetVisibilityService, appWidgetId)
+                        if (currentItem != null) {
+                            if (abs(dx) > abs(dy)) {
+                                // Deslizamiento horizontal: Derecha (+0.6) o Izquierda (-0.6)
+                                val pan = if (dx > 0) 0.6f else -0.6f
+                                moveCameraPtz(currentItem.rtspUrl, pan, 0f)
+                            } else {
+                                // Deslizamiento vertical: Arriba (+0.6) o Abajo (-0.6)
+                                val tilt = if (dy < 0) 0.6f else -0.6f
+                                moveCameraPtz(currentItem.rtspUrl, 0f, tilt)
+                            }
+                        }
+                    }
+                    true
+                }
+                else -> true
+            }
         }
 
         val textureView = TextureView(this).apply {
@@ -256,12 +304,12 @@ class WidgetVisibilityService : AccessibilityService() {
         }
         container.addView(textureView)
 
+        // Se elimina FLAG_NOT_TOUCHABLE para recibir los gestos PTZ sobre el video
         val params = WindowManager.LayoutParams(
             videoRect.width(),
             videoRect.height(),
             WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                    WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
                     WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
             PixelFormat.TRANSLUCENT
         ).apply {
@@ -301,6 +349,7 @@ class WidgetVisibilityService : AccessibilityService() {
                                 session.isPlaying = true
                                 val currentItem = WidgetPrefs.getWidget(this@WidgetVisibilityService, appWidgetId)
                                 mediaPlayer.volume = if (currentItem?.isMuted == true) 0 else 100
+                                session.container.visibility = View.VISIBLE
                                 session.container.alpha = 1f
                                 CameraWidgetProvider.updateWidgetUI(
                                     this@WidgetVisibilityService,
@@ -311,7 +360,7 @@ class WidgetVisibilityService : AccessibilityService() {
                             }
                             MediaPlayer.Event.EncounteredError -> {
                                 session.isPlaying = false
-                                session.container.alpha = 0f
+                                session.container.visibility = View.GONE
                                 CameraWidgetProvider.updateWidgetUI(
                                     this@WidgetVisibilityService,
                                     appWidgetId,
@@ -335,6 +384,118 @@ class WidgetVisibilityService : AccessibilityService() {
         }
     }
 
+    // Controlador ONVIF PTZ por puerto 8899
+    private fun moveCameraPtz(rtspUrl: String, panX: Float, tiltY: Float) {
+        ptzExecutor.execute {
+            try {
+                val uri = Uri.parse(rtspUrl)
+                val host = uri.host ?: return@execute
+                val userInfo = uri.userInfo ?: ""
+                val user = userInfo.substringBefore(":", "admin")
+                val pass = if (userInfo.contains(":")) userInfo.substringAfter(":") else ""
+
+                val token = profileTokensCache[host] ?: fetchProfileToken(host, user, pass).also {
+                    profileTokensCache[host] = it
+                }
+
+                val moveBody = """
+                    <tptz:ContinuousMove xmlns:tptz="http://www.onvif.org/ver20/ptz/wsdl" xmlns:tt="http://www.onvif.org/ver10/schema">
+                        <tptz:ProfileToken>$token</tptz:ProfileToken>
+                        <tptz:Velocity>
+                            <tt:PanTilt x="$panX" y="$tiltY"/>
+                        </tptz:Velocity>
+                    </tptz:ContinuousMove>
+                """.trimIndent()
+
+                val stopBody = """
+                    <tptz:Stop xmlns:tptz="http://www.onvif.org/ver20/ptz/wsdl">
+                        <tptz:ProfileToken>$token</tptz:ProfileToken>
+                        <tptz:PanTilt>true</tptz:PanTilt>
+                        <tptz:Zoom>true</tptz:Zoom>
+                    </tptz:Stop>
+                """.trimIndent()
+
+                sendOnvifSoap(host, 8899, "/onvif/ptz_service", user, pass, moveBody)
+                Thread.sleep(450)
+                sendOnvifSoap(host, 8899, "/onvif/ptz_service", user, pass, stopBody)
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    private fun fetchProfileToken(host: String, user: String, pass: String): String {
+        val body = """<trt:GetProfiles xmlns:trt="http://www.onvif.org/ver10/media/wsdl"/>"""
+        val response = sendOnvifSoap(host, 8899, "/onvif/media_service", user, pass, body)
+        val match = Regex("""Profiles[^>]*token="([^"]+)"""").find(response)
+        return match?.groupValues?.get(1) ?: "Profile_1"
+    }
+
+    private fun sendOnvifSoap(
+        host: String,
+        port: Int,
+        path: String,
+        user: String,
+        pass: String,
+        bodyXml: String
+    ): String {
+        val securityHeader = if (user.isNotEmpty()) buildWsSecurityHeader(user, pass) else ""
+        val envelope = """
+            <?xml version="1.0" encoding="utf-8"?>
+            <s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope">
+                $securityHeader
+                <s:Body>$bodyXml</s:Body>
+            </s:Envelope>
+        """.trimIndent()
+
+        val endpoints = listOf(path, "/onvif/ptz", "/onvif/device_service")
+        for (ep in endpoints) {
+            try {
+                val url = URL("http://$host:$port$ep")
+                val conn = (url.openConnection() as HttpURLConnection).apply {
+                    requestMethod = "POST"
+                    connectTimeout = 2000
+                    readTimeout = 2000
+                    doOutput = true
+                    setRequestProperty("Content-Type", "application/soap+xml; charset=utf-8")
+                }
+                conn.outputStream.use { it.write(envelope.toByteArray(Charsets.UTF_8)) }
+                if (conn.responseCode in 200..299) {
+                    return conn.inputStream.bufferedReader().use { it.readText() }
+                }
+            } catch (_: Exception) {
+            }
+        }
+        return ""
+    }
+
+    private fun buildWsSecurityHeader(user: String, pass: String): String {
+        val nonceBytes = ByteArray(16).also { Random.nextBytes(it) }
+        val nonceBase64 = Base64.encodeToString(nonceBytes, Base64.NO_WRAP)
+        val sdf = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", Locale.US).apply {
+            timeZone = TimeZone.getTimeZone("UTC")
+        }
+        val created = sdf.format(Date())
+
+        val md = MessageDigest.getInstance("SHA-1")
+        md.update(nonceBytes)
+        md.update(created.toByteArray(Charsets.UTF_8))
+        md.update(pass.toByteArray(Charsets.UTF_8))
+        val digestBase64 = Base64.encodeToString(md.digest(), Base64.NO_WRAP)
+
+        return """
+            <s:Header>
+                <Security s:mustUnderstand="1" xmlns="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd">
+                    <UsernameToken>
+                        <Username>$user</Username>
+                        <Password Type="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-username-token-profile-1.0#PasswordDigest">$digestBase64</Password>
+                        <Nonce EncodingType="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-soap-message-security-1.0#Base64Binary">$nonceBase64</Nonce>
+                        <Created xmlns="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd">$created</Created>
+                    </UsernameToken>
+                </Security>
+            </s:Header>
+        """.trimIndent()
+    }
+
     fun updateMuteState(appWidgetId: Int, isMuted: Boolean) {
         activeStreams[appWidgetId]?.mediaPlayer?.volume = if (isMuted) 0 else 100
     }
@@ -343,7 +504,6 @@ class WidgetVisibilityService : AccessibilityService() {
         val session = activeStreams.remove(appWidgetId) ?: return
         session.isPlaying = false
 
-        // Guardar última captura como vista previa estática cuando el widget entra en ahorro de energía
         var previewBmp: Bitmap? = null
         if (session.textureView.isAvailable) {
             val raw = session.textureView.getBitmap(480, 270)
@@ -387,6 +547,7 @@ class WidgetVisibilityService : AccessibilityService() {
         mainHandler.removeCallbacksAndMessages(null)
         unregisterReceiver(screenReceiver)
         stopAllStreams()
+        ptzExecutor.shutdownNow()
         if (::libVLC.isInitialized) {
             libVLC.release()
         }
