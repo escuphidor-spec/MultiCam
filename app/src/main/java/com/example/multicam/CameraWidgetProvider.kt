@@ -9,7 +9,6 @@ import android.graphics.Bitmap
 import android.view.View
 import android.widget.RemoteViews
 import com.google.gson.Gson
-import com.google.gson.reflect.TypeToken
 
 data class CameraItem(
     val appWidgetId: Int,
@@ -20,10 +19,7 @@ data class CameraItem(
 
 object WidgetPrefs {
     private const val PREFS_NAME = "multicam_widget_prefs"
-    private const val KEY_MAP = "widgets_map"
-
-    // Clase explícita para evitar errores de compilación con objetos anónimos en Kotlin
-    private class MapTypeToken : TypeToken>()
+    private const val KEY_MAP = "widgets_array"
 
     fun saveWidget(context: Context, item: CameraItem) {
         val map = getAllWidgets(context).toMutableMap()
@@ -45,12 +41,16 @@ object WidgetPrefs {
         val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         val json = prefs.getString(KEY_MAP, null) ?: return emptyMap()
         
-        return Gson().fromJson(json, MapTypeToken().type) ?: emptyMap()
+        // Solución definitiva: Usamos un Array nativo para evitar los errores de compilación con TypeToken
+        val array = Gson().fromJson(json, Array<CameraItem>::class.java) ?: emptyArray()
+        return array.associateBy { it.appWidgetId }
     }
 
     private fun saveMap(context: Context, map: Map<Int, CameraItem>) {
         val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        prefs.edit().putString(KEY_MAP, Gson().toJson(map)).apply()
+        // Convertimos a Array antes de guardar
+        val array = map.values.toTypedArray()
+        prefs.edit().putString(KEY_MAP, Gson().toJson(array)).apply()
     }
 }
 
