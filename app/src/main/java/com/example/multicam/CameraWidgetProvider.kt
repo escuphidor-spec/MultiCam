@@ -10,7 +10,6 @@ import android.view.View
 import android.widget.RemoteViews
 import com.google.gson.Gson
 import com.google.gson.reflect.TypeToken
-import java.lang.reflect.Type
 
 data class CameraItem(
     val appWidgetId: Int,
@@ -22,6 +21,9 @@ data class CameraItem(
 object WidgetPrefs {
     private const val PREFS_NAME = "multicam_widget_prefs"
     private const val KEY_MAP = "widgets_map"
+
+    // Clase explícita para evitar errores de compilación con objetos anónimos en Kotlin
+    private class MapTypeToken : TypeToken>()
 
     fun saveWidget(context: Context, item: CameraItem) {
         val map = getAllWidgets(context).toMutableMap()
@@ -43,9 +45,7 @@ object WidgetPrefs {
         val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         val json = prefs.getString(KEY_MAP, null) ?: return emptyMap()
         
-        // Corrección de sintaxis para TypeToken en Kotlin
-        val type: Type = object : TypeToken>() {}.type
-        return Gson().fromJson(json, type) ?: emptyMap()
+        return Gson().fromJson(json, MapTypeToken().type) ?: emptyMap()
     }
 
     private fun saveMap(context: Context, map: Map<Int, CameraItem>) {
