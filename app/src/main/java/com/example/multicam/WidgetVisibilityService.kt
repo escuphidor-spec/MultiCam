@@ -24,7 +24,6 @@ import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import android.widget.FrameLayout
-import android.widget.Toast
 import org.videolan.libvlc.LibVLC
 import org.videolan.libvlc.Media
 import org.videolan.libvlc.MediaPlayer
@@ -140,7 +139,6 @@ class WidgetVisibilityService : AccessibilityService() {
             val rect = visibleWidgets[id]
 
             if (rect == null) {
-                // Ocultar vista inmediatamente para no interceptar toques en otras páginas o apps
                 session.container.visibility = View.GONE
                 session.mediaPlayer.volume = 0
 
@@ -262,7 +260,7 @@ class WidgetVisibilityService : AccessibilityService() {
             clipToOutline = true
         }
 
-        // Detector de deslizamiento (Arriba, Abajo, Izquierda, Derecha) para mover la cámara
+        // Detector de gestos de deslizamiento (Arriba, Abajo, Izquierda, Derecha)
         var downX = 0f
         var downY = 0f
         container.setOnTouchListener { _, event ->
@@ -280,11 +278,13 @@ class WidgetVisibilityService : AccessibilityService() {
                         val currentItem = WidgetPrefs.getWidget(this@WidgetVisibilityService, appWidgetId)
                         if (currentItem != null) {
                             if (abs(dx) > abs(dy)) {
-                                // Deslizamiento horizontal: Derecha (+0.6) o Izquierda (-0.6)
+                                // Deslizamiento horizontal: Derecha (dx > 0) o Izquierda (dx < 0)
+                                // Si gira al revés horizontalmente, invierte "0.6f else -0.6f" por "-0.6f else 0.6f"
                                 val pan = if (dx > 0) 0.6f else -0.6f
                                 moveCameraPtz(currentItem.rtspUrl, pan, 0f)
                             } else {
-                                // Deslizamiento vertical: Arriba (+0.6) o Abajo (-0.6)
+                                // Deslizamiento vertical: Arriba (dy < 0) o Abajo (dy > 0)
+                                // Si gira al revés verticalmente, invierte "0.6f else -0.6f" por "-0.6f else 0.6f"
                                 val tilt = if (dy < 0) 0.6f else -0.6f
                                 moveCameraPtz(currentItem.rtspUrl, 0f, tilt)
                             }
@@ -304,7 +304,6 @@ class WidgetVisibilityService : AccessibilityService() {
         }
         container.addView(textureView)
 
-        // Se elimina FLAG_NOT_TOUCHABLE para recibir los gestos PTZ sobre el video
         val params = WindowManager.LayoutParams(
             videoRect.width(),
             videoRect.height(),
@@ -384,18 +383,23 @@ class WidgetVisibilityService : AccessibilityService() {
         }
     }
 
-    // Controlador ONVIF PTZ por puerto 8899
+    // Controlador ONVIF PTZ multi-cámara (calcula el puerto ONVIF según el puerto RTSP del widget)
     private fun moveCameraPtz(rtspUrl: String, panX: Float, tiltY: Float) {
         ptzExecutor.execute {
             try {
                 val uri = Uri.parse(rtspUrl)
                 val host = uri.host ?: return@execute
+                val rtspPort = if (uri.port != -1) uri.port else 554
+                // Si RTSP es 554 -> ONVIF 8899; si RTSP es 1554 -> ONVIF 18899; si es 2554 -> ONVIF 28899
+                val onvifPort = if (rtspPort > 1000) (rtspPort - 554) + 8899 else 8899
+
                 val userInfo = uri.userInfo ?: ""
                 val user = userInfo.substringBefore(":", "admin")
                 val pass = if (userInfo.contains(":")) userInfo.substringAfter(":") else ""
 
-                val token = profileTokensCache[host] ?: fetchProfileToken(host, user, pass).also {
-                    profileTokensCache[host] = it
+                val cacheKey = "$host:$onvifPort"
+                val token = profileTokensCache[cacheKey] ?: fetchProfileToken(host, onvifPort, user, pass).also {
+                    profileTokensCache[cacheKey] = it
                 }
 
                 val moveBody = """
@@ -415,17 +419,18 @@ class WidgetVisibilityService : AccessibilityService() {
                     </tptz:Stop>
                 """.trimIndent()
 
-                sendOnvifSoap(host, 8899, "/onvif/ptz_service", user, pass, moveBody)
+                sendOnvifSoap(host, onvifPort, "/onvif/ptz_service", user, pass, moveBody)
+                // Duración del giro por cada deslizamiento (450 ms)
                 Thread.sleep(450)
-                sendOnvifSoap(host, 8899, "/onvif/ptz_service", user, pass, stopBody)
+                sendOnvifSoap(host, onvifPort, "/onvif/ptz_service", user, pass, stopBody)
             } catch (_: Exception) {
             }
         }
     }
 
-    private fun fetchProfileToken(host: String, user: String, pass: String): String {
+    private fun fetchProfileToken(host: String, onvifPort: Int, user: String, pass: String): String {
         val body = """<trt:GetProfiles xmlns:trt="http://www.onvif.org/ver10/media/wsdl"/>"""
-        val response = sendOnvifSoap(host, 8899, "/onvif/media_service", user, pass, body)
+        val response = sendOnvifSoap(host, onvifPort, "/onvif/media_service", user, pass, body)
         val match = Regex("""Profiles[^>]*token="([^"]+)"""").find(response)
         return match?.groupValues?.get(1) ?: "Profile_1"
     }
